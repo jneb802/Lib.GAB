@@ -145,7 +145,9 @@ namespace Lib.GAB.Server
         {
             SessionInfo session;
             if (!_sessions.TryGetValue(connection.Id, out session))
+            {
                 return;
+            }
 
             switch (message)
             {
@@ -156,6 +158,7 @@ namespace Lib.GAB.Server
                 // Responses and events are typically not handled by the server
                 case GabpResponse _:
                 case GabpEvent _:
+                default:
                     break;
             }
         }
@@ -209,7 +212,7 @@ namespace Lib.GAB.Server
             {
                 var helloParams = JsonConvert.DeserializeObject<SessionHelloParams>(
                     JsonConvert.SerializeObject(request.Params));
-
+                
                 if (helloParams == null || helloParams.Token != _config.Token)
                 {
                     await SendErrorResponseAsync(connection, request.Id, 

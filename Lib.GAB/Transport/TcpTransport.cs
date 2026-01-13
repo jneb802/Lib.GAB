@@ -9,6 +9,10 @@ using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Lib.GAB.Protocol;
 
+// Unity/Mono compatibility note:
+// Using dedicated threads instead of Task.Run for better compatibility
+// with Unity's Mono runtime which has limited ThreadPool support.
+
 namespace Lib.GAB.Transport
 {
     /// <summary>
@@ -96,7 +100,7 @@ namespace Lib.GAB.Transport
 
         public int Port { get; private set; }
 
-        public async Task StartAsync(CancellationToken cancellationToken = default(CancellationToken))
+        public Task StartAsync(CancellationToken cancellationToken = default(CancellationToken))
         {
             if (_running)
                 throw new InvalidOperationException("Transport is already running");
@@ -106,8 +110,15 @@ namespace Lib.GAB.Transport
             Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
             _running = true;
 
-            // Start accepting connections in background
-            var task = Task.Run(async () => await AcceptConnectionsAsync(cancellationToken), cancellationToken);
+            // Use a dedicated thread instead of Task.Run for Unity/Mono compatibility
+            var acceptThread = new Thread(() => AcceptConnectionsLoop(cancellationToken))
+            {
+                IsBackground = true,
+                Name = "GABP-Accept"
+            };
+            acceptThread.Start();
+            
+            return Task.FromResult(0);
         }
 
         public Task StopAsync(CancellationToken cancellationToken = default(CancellationToken))
@@ -119,37 +130,57 @@ namespace Lib.GAB.Transport
             return Task.FromResult(0);
         }
 
-        private async Task AcceptConnectionsAsync(CancellationToken cancellationToken)
+        /// <summary>
+        /// Synchronous accept loop for Unity/Mono compatibility
+        /// </summary>
+        private void AcceptConnectionsLoop(CancellationToken cancellationToken)
         {
             while (_running && !cancellationToken.IsCancellationRequested)
             {
                 try
                 {
-                    var tcpClient = await _listener.AcceptTcpClientAsync();
+                    // Use synchronous Accept for better Unity compatibility
+                    if (!_listener.Pending())
+                    {
+                        Thread.Sleep(50); // Small sleep to prevent busy-waiting
+                        continue;
+                    }
+                    
+                    var tcpClient = _listener.AcceptTcpClient();
                     var connection = new TcpConnection(tcpClient);
                     
                     ConnectionEstablished?.Invoke(this, new ConnectionEstablishedEventArgs(connection));
                     
-                    // Start reading messages from this connection
-                    var messageTask = Task.Run(async () => await ReadMessagesAsync(connection, cancellationToken), cancellationToken);
+                    // Start a dedicated thread for reading messages from this connection
+                    var readThread = new Thread(() => ReadMessagesLoop(connection, cancellationToken))
+                    {
+                        IsBackground = true,
+                        Name = $"GABP-Read-{connection.Id.Substring(0, 8)}"
+                    };
+                    readThread.Start();
                 }
                 catch (ObjectDisposedException)
                 {
-                    // Expected when stopping
+                    break;
+                }
+                catch (SocketException)
+                {
                     break;
                 }
                 catch (Exception)
                 {
-                    // Log error and continue
                     if (_running)
                     {
-                        await Task.Delay(1000, cancellationToken);
+                        Thread.Sleep(1000);
                     }
                 }
             }
         }
 
-        private async Task ReadMessagesAsync(TcpConnection connection, CancellationToken cancellationToken)
+        /// <summary>
+        /// Synchronous read loop for Unity/Mono compatibility
+        /// </summary>
+        private void ReadMessagesLoop(TcpConnection connection, CancellationToken cancellationToken)
         {
             var stream = connection._client.GetStream();
             var buffer = new byte[8192];
@@ -157,16 +188,31 @@ namespace Lib.GAB.Transport
 
             try
             {
+                // Set a read timeout so we can check cancellation periodically
+                stream.ReadTimeout = 1000; // 1 second timeout
+                
                 while (connection.IsConnected && !cancellationToken.IsCancellationRequested)
                 {
-                    var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-                    if (bytesRead == 0) break;
+                    try
+                    {
+                        // Blocking read - will timeout after ReadTimeout ms
+                        var bytesRead = stream.Read(buffer, 0, buffer.Length);
+                        if (bytesRead == 0)
+                        {
+                            break;
+                        }
 
-                    var data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                    messageBuffer.Append(data);
+                        var data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                        messageBuffer.Append(data);
 
-                    // Process complete messages
-                    await ProcessMessagesAsync(connection, messageBuffer, cancellationToken);
+                        // Process complete messages
+                        ProcessMessages(connection, messageBuffer);
+                    }
+                    catch (IOException)
+                    {
+                        // Read timeout - expected, continue to check cancellation
+                        continue;
+                    }
                 }
             }
             catch (Exception)
@@ -179,30 +225,46 @@ namespace Lib.GAB.Transport
             }
         }
 
-        private Task ProcessMessagesAsync(TcpConnection connection, StringBuilder buffer, CancellationToken cancellationToken)
+        /// <summary>
+        /// Synchronous message processing for Unity/Mono compatibility
+        /// </summary>
+        private void ProcessMessages(TcpConnection connection, StringBuilder buffer)
         {
             while (true)
             {
                 var content = buffer.ToString();
                 var headerEnd = content.IndexOf("\r\n\r\n", StringComparison.Ordinal);
                 
-                if (headerEnd == -1) break; // No complete header yet
+                if (headerEnd == -1)
+                {
+                    break;
+                }
 
                 var headerText = content.Substring(0, headerEnd);
                 var contentLengthIndex = headerText.IndexOf("Content-Length:", StringComparison.OrdinalIgnoreCase);
                 
-                if (contentLengthIndex == -1) break;
+                if (contentLengthIndex == -1)
+                {
+                    break;
+                }
 
                 var startIndex = contentLengthIndex + "Content-Length:".Length;
                 var endIndex = headerText.IndexOf('\r', startIndex);
                 if (endIndex == -1) endIndex = headerText.IndexOf('\n', startIndex);
-                if (endIndex == -1) break;
+                // If no newline after the value, use end of header text
+                if (endIndex == -1) endIndex = headerText.Length;
 
                 var contentLengthStr = headerText.Substring(startIndex, endIndex - startIndex).Trim();
-                if (!int.TryParse(contentLengthStr, out var contentLength)) break;
+                if (!int.TryParse(contentLengthStr, out var contentLength))
+                {
+                    break;
+                }
 
                 var messageStart = headerEnd + 4;
-                if (content.Length < messageStart + contentLength) break; // Incomplete message
+                if (content.Length < messageStart + contentLength)
+                {
+                    break;
+                }
 
                 var messageJson = content.Substring(messageStart, contentLength);
                 
@@ -216,14 +278,12 @@ namespace Lib.GAB.Transport
                 }
                 catch (Exception)
                 {
-                    // Invalid JSON or message format
+                    // Failed to parse message
                 }
 
                 // Remove processed message from buffer
                 buffer.Remove(0, messageStart + contentLength);
             }
-
-            return Task.FromResult(0);
         }
 
         private static GabpMessage ParseMessage(string json)
